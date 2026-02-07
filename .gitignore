@@ -51,7 +51,6 @@ logs/
 .pytest_cache/
 
 # Alembic
-alembic/versions/*.py
 !alembic/versions/__init__.py
 
 # Docker
