@@ -10,6 +10,8 @@ from app.models.session import Session as SessionModel
 import secrets
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
+import hashlib
+
 
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -120,7 +122,6 @@ def create_refresh_token(user_id: str) -> str:
         )
 
 
-import hashlib
 
 def hash_refresh_token(refresh_token: str) -> str:
     """
