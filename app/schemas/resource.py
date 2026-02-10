@@ -1,6 +1,6 @@
 # app/schemas/resource.py
 from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, ForwardRef
 from datetime import datetime
 from uuid import UUID
 
@@ -21,13 +21,13 @@ class ResourceResponse(ResourceBase):
 
 class SlotBase(BaseModel):
     start_time: datetime
-    end_time: datetime
-    capacity: int
+    end_time: datetime 
 
 class SlotResponse(SlotBase):
     id: UUID
     resource_id: UUID
     version: int
+    seats: List["SeatResponse"] = []
     
     class Config:
         from_attributes = True
@@ -40,3 +40,7 @@ class ResourceListResponse(BaseModel):
     total: int
     page: int
     size: int
+
+# Forward reference resolution
+from app.schemas.seat import SeatResponse
+SlotResponse.model_rebuild()

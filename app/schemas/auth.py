@@ -1,6 +1,14 @@
 from pydantic import BaseModel, EmailStr
 from app.schemas.user import UserResponse
 
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class TokenData(BaseModel):
+    sub: str  # subject (user_id)
+    exp: int  # expiration time
+
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
@@ -17,3 +25,6 @@ class TokenResponse(BaseModel):
 class AuthResponse(BaseModel):
     user: UserResponse
     tokens: TokenResponse
+
+# Alias for compatibility
+LoginRequest = UserLogin

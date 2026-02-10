@@ -10,7 +10,10 @@ from app.schemas.booking import (
     BookingWithSlot, 
     BookingListResponse,
     BookingStatus,
-    BookingCancelRequest
+    BookingCancelRequest,
+    BookingListWithDetailsResponse,
+    BookingListMinimalResponse,
+    BookingWithDetails
 )
 from app.middleware.auth import get_current_user
 from app.schemas.user import UserResponse
@@ -24,14 +27,14 @@ def create_booking(
     db: Session = Depends(get_db),
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Create a new booking"""
-    logger.info(f"API request: POST /bookings/ - user={current_user.id}, slot={booking_data.slot_id}")
+    """Create a new booking for a specific seat"""
+    logger.info(f"API request: POST /bookings/ - user={current_user.id}, seat={booking_data.seat_id}")
     
     try:
         return BookingService.create_booking(
             db=db,
             user_id=current_user.id,
-            slot_id=booking_data.slot_id
+            seat_id=booking_data.seat_id
         )
     except HTTPException:
         raise
@@ -42,19 +45,20 @@ def create_booking(
             detail="Internal server error"
         )
 
-@router.get("/", response_model=BookingListResponse)
-def get_user_bookings(
+
+@router.get("/", response_model=BookingListMinimalResponse)
+def get_user_bookings_with_details(
     skip: int = Query(0, ge=0, description="Number of items to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of items to return"),
     status: Optional[BookingStatus] = Query(None, description="Filter by booking status"),
     db: Session = Depends(get_db),
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Get current user's bookings"""
+    """Get current user's bookings with minimal resource info"""
     logger.info(f"API request: GET /bookings/ - user={current_user.id}, status={status}")
     
     try:
-        return BookingService.get_user_bookings(
+        return BookingService.get_user_bookings_with_details(
             db=db,
             user_id=current_user.id,
             skip=skip,
@@ -64,13 +68,13 @@ def get_user_bookings(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in get_user_bookings: {e}", exc_info=True)
+        logger.error(f"Unexpected error in get_user_bookings_with_details: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail="Internal server error"
         )
 
-@router.get("/{booking_id}", response_model=BookingWithSlot)
+@router.get("/{booking_id}", response_model=BookingWithDetails)
 def get_booking(
     booking_id: UUID,
     db: Session = Depends(get_db),
@@ -144,6 +148,36 @@ def get_slot_bookings(
         raise
     except Exception as e:
         logger.error(f"Unexpected error in get_slot_bookings: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error"
+        )
+
+@router.get("/admin/{user_id}", response_model=BookingListResponse)
+def get_all_user_bookings_admin(
+    user_id: UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    status: Optional[BookingStatus] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: UserResponse = Depends(get_current_user)
+):
+    """Get all bookings for a user including cancelled (admin endpoint)"""
+    logger.info(f"API request: GET /bookings/admin/{user_id} - admin={current_user.id}")
+    
+    try:
+        # TODO: Add admin role check
+        return BookingService.get_all_user_bookings(
+            db=db,
+            user_id=user_id,
+            skip=skip,
+            limit=limit,
+            status=status
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_all_user_bookings_admin: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail="Internal server error"

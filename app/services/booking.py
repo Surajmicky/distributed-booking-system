@@ -2,12 +2,15 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from uuid import UUID
 from datetime import datetime, timezone
-from fastapi import HTTPException, status
+from fastapi import HTTPException
+from fastapi import status as http_status
 from app.models.booking import Booking
 from app.models.slot import Slot
+from app.models.seat import Seat
 from app.models.resource import Resource
-from app.schemas.booking import BookingResponse, BookingWithSlot, BookingListResponse, BookingStatus
-from app.schemas.resource import SlotResponse
+from app.schemas.booking import BookingResponse, BookingWithSlot, BookingListResponse, BookingStatus, BookingWithDetails, BookingListWithDetailsResponse, BookingMinimal, BookingListMinimalResponse
+from app.schemas.resource import SlotResponse, ResourceResponse
+from app.services.resource import ResourceService
 from app.core.logging import logger
 
 class BookingService:
@@ -16,60 +19,56 @@ class BookingService:
     def create_booking(
         db: Session, 
         user_id: UUID, 
-        slot_id: UUID
+        seat_id: UUID
     ) -> BookingResponse:
         """Create a new booking"""
-        logger.info(f"Creating booking for user {user_id}, slot {slot_id}")
+        logger.info(f"Creating booking for user {user_id}, seat {seat_id}")
         
         try:
-            # Check if slot exists and is available
-            slot = db.query(Slot).filter(Slot.id == slot_id).first()
-            if not slot:
-                logger.warning(f"Slot not found: {slot_id}")
+            # Check if seat exists and is available
+            seat = db.query(Seat).filter(Seat.id == seat_id).first()
+            if not seat:
+                logger.warning(f"Seat not found: {seat_id}")
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Slot not found"
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Seat not found"
+                )
+            
+            # Check if seat is available
+            if seat.status != "available":
+                logger.warning(f"Seat {seat_id} not available, status: {seat.status}")
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="Seat is not available"
                 )
             
             # Check if slot is in the future
-            if slot.start_time <= datetime.now(timezone.utc):
-                logger.warning(f"Attempted to book past slot: {slot_id}")
+            slot = db.query(Slot).filter(Slot.id == seat.slot_id).first()
+            if slot and slot.start_time <= datetime.now(timezone.utc):
+                logger.warning(f"Attempted to book past slot: {slot.id}")
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Cannot book past time slots"
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot book seats for past time slots"
                 )
             
-            # Check if slot is already booked
-            existing_booking = db.query(Booking).filter(
-                Booking.slot_id == slot_id,
+            # Check if user already has a booking for this slot
+            existing_booking = db.query(Booking).join(Seat).filter(
+                Booking.user_id == user_id,
+                Seat.slot_id == seat.slot_id,
                 Booking.status == BookingStatus.CONFIRMED
             ).first()
             
             if existing_booking:
-                logger.warning(f"Slot already booked: {slot_id}")
+                logger.warning(f"User {user_id} already has booking for slot {seat.slot_id}")
                 raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Slot is already booked"
-                )
-            
-            # Check if user already has a booking for this slot
-            user_existing_booking = db.query(Booking).filter(
-                Booking.user_id == user_id,
-                Booking.slot_id == slot_id,
-                Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING])
-            ).first()
-            
-            if user_existing_booking:
-                logger.warning(f"User {user_id} already booked slot {slot_id}")
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="You already have a booking for this slot"
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="You already have a booking for this time slot"
                 )
             
             # Create the booking
             booking = Booking(
                 user_id=user_id,
-                slot_id=slot_id,
+                seat_id=seat_id,
                 status=BookingStatus.CONFIRMED
             )
             
@@ -86,46 +85,66 @@ class BookingService:
             logger.error(f"Error creating booking: {e}", exc_info=True)
             db.rollback()
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create booking"
             )
     
+
     @staticmethod
-    def get_user_bookings(
+    def get_user_bookings_with_details(
         db: Session, 
         user_id: UUID,
         skip: int = 0,
         limit: int = 100,
         status: Optional[BookingStatus] = None
-    ) -> BookingListResponse:
-        """Get bookings for a specific user"""
-        logger.info(f"Fetching bookings for user {user_id}, status={status}")
+    ) -> BookingListMinimalResponse:
+        """Get bookings for a user with minimal resource info"""
+        logger.info(f"Fetching minimal bookings for user {user_id}, status={status}")
         
         try:
-            query = db.query(Booking).filter(Booking.user_id == user_id)
+            query = db.query(Booking, Seat, Slot, Resource).join(Seat, Booking.seat_id == Seat.id).join(Slot, Seat.slot_id == Slot.id).join(Resource, Slot.resource_id == Resource.id).filter(
+                Booking.user_id == user_id,
+                Booking.status == BookingStatus.CONFIRMED
+            )
             
             if status:
                 query = query.filter(Booking.status == status)
             
-            # Order by creation time (newest first)
             query = query.order_by(Booking.created_at.desc())
             
             total = query.count()
-            bookings = query.offset(skip).limit(limit).all()
+            booking_results = query.offset(skip).limit(limit).all()
             
-            logger.info(f"Found {total} bookings for user {user_id}")
+            minimal_bookings = []
+            for booking, seat, slot, resource in booking_results:
+                minimal_booking = BookingMinimal(
+                    id=booking.id,
+                    user_id=booking.user_id,
+                    seat_id=booking.seat_id,
+                    status=booking.status,
+                    created_at=booking.created_at,
+                    resource_name=resource.name,
+                    resource_type=resource.type,
+                    slot_start_time=slot.start_time,
+                    slot_end_time=slot.end_time,
+                    seat_number=seat.seat_number,
+                    seat_type=seat.seat_type
+                )
+                minimal_bookings.append(minimal_booking)
             
-            return BookingListResponse(
-                bookings=[BookingResponse.model_validate(booking) for booking in bookings],
+            logger.info(f"Found {len(minimal_bookings)} minimal bookings for user {user_id}")
+            
+            return BookingListMinimalResponse(
+                bookings=minimal_bookings,
                 total=total,
                 page=skip // limit + 1 if limit > 0 else 1,
                 size=limit
             )
             
         except Exception as e:
-            logger.error(f"Error fetching user bookings: {e}", exc_info=True)
+            logger.error(f"Error fetching minimal user bookings: {e}", exc_info=True)
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to fetch bookings"
             )
     
@@ -134,7 +153,7 @@ class BookingService:
         db: Session, 
         booking_id: UUID,
         user_id: Optional[UUID] = None
-    ) -> Optional[BookingWithSlot]:
+    ) -> Optional[BookingWithDetails]:
         """Get a specific booking by ID (with slot details)"""
         logger.info(f"Fetching booking {booking_id} for user {user_id}")
         
@@ -152,29 +171,29 @@ class BookingService:
                 logger.warning(f"Booking not found: {booking_id}")
                 return None
             
-            # Get slot separately
-            slot = db.query(Slot).filter(Slot.id == booking.slot_id).first()
-            if not slot:
+            # Get slot info from ResourceService
+            slot_response = ResourceService.get_slot_with_availability(db, booking.slot_id)
+            
+            if not slot_response:
                 logger.warning(f"Slot not found for booking {booking_id}")
                 return None
             
-            # Create slot response
-            slot_response = SlotResponse(
-                id=slot.id,
-                resource_id=slot.resource_id,
-                start_time=slot.start_time,
-                end_time=slot.end_time,
-                capacity=slot.capacity,
-                version=slot.version
-            )
+            # Get resource details
+            resource = db.query(Resource).filter(Resource.id == slot_response.resource_id).first()
+            if not resource:
+                logger.warning(f"Resource not found for booking {booking_id}")
+                return None
+                
+            resource_response = ResourceResponse.model_validate(resource)
             
-            booking_response = BookingWithSlot(
+            booking_response = BookingWithDetails(
                 id=booking.id,
                 user_id=booking.user_id,
                 slot_id=booking.slot_id,
                 status=booking.status,
                 created_at=booking.created_at,
-                slot=slot_response
+                slot=slot_response,
+                resource=resource_response
             )
             
             logger.info(f"Booking found: {booking_id}")
@@ -265,4 +284,42 @@ class BookingService:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to fetch slot bookings"
+            )
+    
+    @staticmethod
+    def get_all_user_bookings(
+        db: Session, 
+        user_id: UUID,
+        skip: int = 0,
+        limit: int = 100,
+        status: Optional[BookingStatus] = None
+    ) -> BookingListResponse:
+        """Get all bookings for a user including cancelled (admin endpoint)"""
+        logger.info(f"Fetching all bookings for user {user_id}, status={status}")
+        
+        try:
+            query = db.query(Booking).filter(Booking.user_id == user_id)
+            
+            if status:
+                query = query.filter(Booking.status == status)
+            
+            query = query.order_by(Booking.created_at.desc())
+            
+            total = query.count()
+            bookings = query.offset(skip).limit(limit).all()
+            
+            logger.info(f"Found {total} bookings for user {user_id}")
+            
+            return BookingListResponse(
+                bookings=[BookingResponse.model_validate(booking) for booking in bookings],
+                total=total,
+                page=skip // limit + 1 if limit > 0 else 1,
+                size=limit
+            )
+            
+        except Exception as e:
+            logger.error(f"Error fetching all user bookings: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to fetch bookings"
             )

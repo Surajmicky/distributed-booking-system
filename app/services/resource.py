@@ -1,14 +1,17 @@
 # app/services/resource_service.py
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from app.models.resource import Resource
 from app.models.slot import Slot
-from app.schemas.resource import ResourceResponse, ResourceWithSlots, SlotResponse, ResourceListResponse
-from app.core.logging import logger
+from app.models.seat import Seat
 from app.models.booking import Booking
+from app.schemas.resource import ResourceResponse, ResourceWithSlots, SlotResponse, ResourceListResponse
+from app.schemas.seat import SeatResponse as SeatResponseSchema
+from app.core.logging import logger
 
 
 class ResourceService:
@@ -101,22 +104,55 @@ class ResourceService:
                 query = query.filter(Slot.end_time <= end_date)
                 logger.info(f"Filtering slots until end_date: {end_date}")
             
-            # Get all slots that meet the time criteria
-            all_slots = query.order_by(Slot.start_time).all()
+            # Get slots with all seats in single query
+            slots_with_seats = db.query(
+                Slot,
+                Seat
+            ).outerjoin(
+                Seat,
+                Slot.id == Seat.slot_id
+            ).filter(
+                Slot.resource_id == resource_id,
+                Slot.start_time >= effective_start_date
+            ).order_by(Slot.start_time, Seat.seat_number).all()
             
-            # Filter out booked slots
-            available_slots = []
-            for slot in all_slots:
-                # Check if slot is already booked
-                existing_booking = db.query(Booking).filter(
-                    Booking.slot_id == slot.id,
-                    Booking.status == "confirmed"
-                ).first()
+            if end_date:
+                slots_with_seats = [s for s in slots_with_seats if s[0].end_time <= end_date]
+            
+            # Group seats by slot
+            slots_dict = {}
+            for slot, seat in slots_with_seats:
+                if slot.id not in slots_dict:
+                    slots_dict[slot.id] = {
+                        'slot': slot,
+                        'seats': []
+                    }
+                if seat:
+                    slots_dict[slot.id]['seats'].append(seat)
+            
+            # Build slot responses with seat details
+            slot_responses = []
+            for slot_data in slots_dict.values():
+                slot = slot_data['slot']
+                seats = slot_data['seats']
                 
-                if not existing_booking:
-                    available_slots.append(slot)
+                # Only include slots that have available seats
+                available_seats = [s for s in seats if s.status == 'available']
+                if available_seats:
+                    # Convert seats to SeatResponse objects
+                    seat_responses = [SeatResponseSchema.model_validate(seat) for seat in seats]
+                    
+                    slot_response = SlotResponse(
+                        id=slot.id,
+                        resource_id=slot.resource_id,
+                        start_time=slot.start_time,
+                        end_time=slot.end_time,
+                        version=slot.version,
+                        seats=seat_responses
+                    )
+                    slot_responses.append(slot_response)
             
-            logger.info(f"Found {len(all_slots)} total slots, {len(available_slots)} available for resource {resource_id}")
+            logger.info(f"Found {len(slot_responses)} available slots for resource {resource_id}")
             
             return ResourceWithSlots(
                 id=resource.id,
@@ -124,7 +160,7 @@ class ResourceService:
                 type=resource.type,
                 meta_data=resource.meta_data,
                 created_at=resource.created_at,
-                slots=[SlotResponse.model_validate(slot) for slot in available_slots]
+                slots=slot_responses
             )
             
         except Exception as e:
@@ -133,6 +169,38 @@ class ResourceService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to fetch resource with slots"
             )   
+            
+    @staticmethod
+    def get_slot_with_availability(db: Session, slot_id: UUID) -> Optional[SlotResponse]:
+        """Get slot with remaining capacity"""
+        try:
+            slot_with_count = db.query(
+                Slot,
+                func.count(Seat.id).label('available_count')
+            ).outerjoin(
+                Seat,
+                and_(Slot.id == Seat.slot_id, Seat.status == 'available')
+            ).filter(Slot.id == slot_id).group_by(Slot.id).first()
+            
+            if not slot_with_count:
+                return None
+            
+            slot, available_count = slot_with_count
+            
+            return SlotResponse(
+                id=slot.id,
+                resource_id=slot.resource_id,
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+                version=slot.version
+            )
+            
+        except Exception as e:
+            logger.error(f"Error fetching slot availability {slot_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to fetch slot availability"
+            )
             
     @staticmethod
     def get_resources_by_type(db: Session, resource_type: str) -> List[ResourceResponse]:
